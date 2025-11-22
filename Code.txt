@@ -3803,12 +3803,27 @@ function parseLinkRouterId_(value) {
 function ensureLinkRouterBatchControlSheet_() {
   var ss = SpreadsheetApp.getActive();
   var sheet = ss.getSheetByName(LINK_ROUTER_BATCH_CONTROL_SHEET);
+  var headers = ['Timestamp', 'Batch ID', 'Lote', 'Status', 'Rotas Processadas', 'Sucessos', 'Falhas', 'Tempo (s)', 'Mensagem'];
   if (!sheet) {
     sheet = ss.insertSheet(LINK_ROUTER_BATCH_CONTROL_SHEET);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    return sheet;
   }
-  var headers = ['Timestamp', 'Batch ID', 'Lote', 'Status', 'Rotas Processadas', 'Sucessos', 'Falhas', 'Tempo (s)', 'Mensagem'];
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  sheet.setFrozenRows(1);
+
+  var firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  var headersMissing = false;
+  for (var i = 0; i < headers.length; i++) {
+    if (!firstRow[i] || firstRow[i] !== headers[i]) {
+      headersMissing = true;
+      break;
+    }
+  }
+
+  if (headersMissing) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  }
   return sheet;
 }
 
