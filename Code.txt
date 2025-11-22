@@ -2675,8 +2675,16 @@ function ensureLinkRouterHistorySheet_(sheetName) {
     sheet = ss.insertSheet(targetName);
   }
   var headers = ['Timestamp', 'Operação', 'Tráfego', 'Empresa ID', 'Domínio ID', 'Slug', 'URL', 'Percentual Enviado (%)', 'Origem do Percentual', 'Status', 'Mensagem'];
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  sheet.setFrozenRows(1);
+  var existingHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  var hasAnyHeader = existingHeaders.some(function (value) {
+    return value !== '' && value !== null;
+  });
+  if (!hasAnyHeader) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+  if (sheet.getFrozenRows() < 1) {
+    sheet.setFrozenRows(1);
+  }
   return sheet;
 }
 
