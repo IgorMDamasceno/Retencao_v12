@@ -3949,7 +3949,7 @@ function runLinkRouterAutoSyncOrchestrator() {
   var props = PropertiesService.getScriptProperties();
   var autoRange = getLinkRouterAutoSyncDateRange_();
 
-  batches.forEach(function (batch, index) {
+    batches.forEach(function (batch, index) {
     var batchLabel = 'Lote ' + (index + 1) + '/' + batches.length;
     var rowNumber = appendLinkRouterBatchControlRow_(controlSheet, {
       timestamp: new Date(),
@@ -3968,11 +3968,13 @@ function runLinkRouterAutoSyncOrchestrator() {
     };
     var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
     props.setProperty(stateKey, JSON.stringify(state));
-    var delayMs = index * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000;
-    var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
-      .timeBased()
-      .after(delayMs)
-      .create();
+      var delayMs = index * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000;
+      // ScriptApp requires at least a 1-minute delay for time-based triggers; ensure a safe minimum.
+      var safeDelayMs = Math.max(delayMs, 60 * 1000);
+      var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
+        .timeBased()
+        .after(safeDelayMs)
+        .create();
     var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
     if (triggerUid) {
       var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
