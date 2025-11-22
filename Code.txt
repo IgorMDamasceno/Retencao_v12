@@ -29,7 +29,7 @@ const LINK_ROUTER_AUTO_SYNC_CROSS_DAY_WINDOW_HOURS = 4;
 const LINK_ROUTER_BATCH_CONTROL_SHEET = 'Controle - Sync Lotes';
 const LINK_ROUTER_SYNC_BATCH_SIZE = 50;
 const LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES = 1;
-const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 1500;
+const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 1700;
 const LINK_ROUTER_BATCH_STATE_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_STATE_';
 const LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_TRIGGER_';
 
@@ -2663,11 +2663,16 @@ function ensureRevShareSheet_() {
   return sheet;
 }
 
-function ensureLinkRouterHistorySheet_() {
+function getLinkRouterBatchHistorySheetName_(batchIndex) {
+  return LINK_ROUTER_HISTORY_SHEET + ' - Lote ' + (batchIndex + 1);
+}
+
+function ensureLinkRouterHistorySheet_(sheetName) {
   var ss = SpreadsheetApp.getActive();
-  var sheet = ss.getSheetByName(LINK_ROUTER_HISTORY_SHEET);
+  var targetName = sheetName || LINK_ROUTER_HISTORY_SHEET;
+  var sheet = ss.getSheetByName(targetName);
   if (!sheet) {
-    sheet = ss.insertSheet(LINK_ROUTER_HISTORY_SHEET);
+    sheet = ss.insertSheet(targetName);
   }
   var headers = ['Timestamp', 'Operação', 'Tráfego', 'Empresa ID', 'Domínio ID', 'Slug', 'URL', 'Percentual Enviado (%)', 'Origem do Percentual', 'Status', 'Mensagem'];
   sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
@@ -3776,7 +3781,7 @@ function syncLinkRouterDistribution(request, options) {
     row[10] = message;
     return row;
   });
-  appendLinkRouterHistory_(historyRows);
+  appendLinkRouterHistory_(historyRows, options.historySheetName);
 
   if (!success) {
     throw new Error(message);
@@ -3949,8 +3954,10 @@ function runLinkRouterAutoSyncOrchestrator() {
   var props = PropertiesService.getScriptProperties();
   var autoRange = getLinkRouterAutoSyncDateRange_();
 
-    batches.forEach(function (batch, index) {
+  batches.forEach(function (batch, index) {
     var batchLabel = 'Lote ' + (index + 1) + '/' + batches.length;
+    var batchHistorySheetName = getLinkRouterBatchHistorySheetName_(index);
+    ensureLinkRouterHistorySheet_(batchHistorySheetName);
     var rowNumber = appendLinkRouterBatchControlRow_(controlSheet, {
       timestamp: new Date(),
       batchId: batchId,
@@ -3964,17 +3971,18 @@ function runLinkRouterAutoSyncOrchestrator() {
       integrations: batch,
       row: rowNumber,
       createdAt: new Date().toISOString(),
-      autoRange: autoRange
+      autoRange: autoRange,
+      historySheetName: batchHistorySheetName
     };
     var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
     props.setProperty(stateKey, JSON.stringify(state));
-      var delayMs = index * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000;
-      // ScriptApp requires at least a 1-minute delay for time-based triggers; ensure a safe minimum.
-      var safeDelayMs = Math.max(delayMs, 60 * 1000);
-      var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
-        .timeBased()
-        .after(safeDelayMs)
-        .create();
+    var delayMs = index * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000;
+    // ScriptApp requires at least a 1-minute delay for time-based triggers; ensure a safe minimum.
+    var safeDelayMs = Math.max(delayMs, 60 * 1000);
+    var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
+      .timeBased()
+      .after(safeDelayMs)
+      .create();
     var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
     if (triggerUid) {
       var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
@@ -4026,6 +4034,8 @@ function runLinkRouterAutoSyncBatch(e) {
   var snapshot = getConfigSnapshot_();
   var trafficByType = snapshot.trafficByType || {};
   var autoRange = state.autoRange || getLinkRouterAutoSyncDateRange_();
+  var batchHistorySheetName = state.historySheetName || getLinkRouterBatchHistorySheetName_(state.batchIndex);
+  ensureLinkRouterHistorySheet_(batchHistorySheetName);
   var successes = [];
   var failures = [];
   var processed = 0;
@@ -4049,7 +4059,7 @@ function runLinkRouterAutoSyncBatch(e) {
         traffic: trafficType,
         message: missingError.message
       });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, missingError);
+      logLinkRouterAutoSyncFailure_(integration, trafficType, missingError, batchHistorySheetName);
       processed++;
       return;
     }
@@ -4066,7 +4076,7 @@ function runLinkRouterAutoSyncBatch(e) {
         request.startDate = autoRange.startDate;
         request.endDate = autoRange.endDate;
       }
-      var result = syncLinkRouterDistribution(request, { snapshot: snapshot });
+      var result = syncLinkRouterDistribution(request, { snapshot: snapshot, historySheetName: batchHistorySheetName });
       successes.push({
         operation: integration.operation,
         traffic: trafficType,
@@ -4080,7 +4090,7 @@ function runLinkRouterAutoSyncBatch(e) {
         traffic: trafficType,
         message: err && err.message ? err.message : String(err)
       });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, err);
+      logLinkRouterAutoSyncFailure_(integration, trafficType, err, batchHistorySheetName);
     }
     processed++;
   });
@@ -4183,7 +4193,7 @@ function updateLinkRouterAutoSyncTrigger_(snapshot) {
   }
 }
 
-function logLinkRouterAutoSyncFailure_(integration, trafficType, error) {
+function logLinkRouterAutoSyncFailure_(integration, trafficType, error, historySheetName) {
   var message = error && error.message ? error.message : String(error || 'Erro desconhecido');
   var row = [
     new Date(),
@@ -4198,14 +4208,14 @@ function logLinkRouterAutoSyncFailure_(integration, trafficType, error) {
     'ERRO',
     message
   ];
-  appendLinkRouterHistory_([row]);
+  appendLinkRouterHistory_([row], historySheetName);
 }
 
-function appendLinkRouterHistory_(rows) {
+function appendLinkRouterHistory_(rows, sheetName) {
   if (!rows || !rows.length) {
     return;
   }
-  var sheet = ensureLinkRouterHistorySheet_();
+  var sheet = ensureLinkRouterHistorySheet_(sheetName);
   var startRow = Math.max(sheet.getLastRow(), 1) + 1;
   sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
 }
