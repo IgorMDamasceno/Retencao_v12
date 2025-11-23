@@ -26,6 +26,12 @@ const DISTRIBUTION_ECPM_EXPONENT = 1.0;
 const DISTRIBUTION_RPS_EXPONENT = 2.7;
 const DISTRIBUTION_SOFTMAX_TAU = 0.30;
 const LINK_ROUTER_AUTO_SYNC_CROSS_DAY_WINDOW_HOURS = 4;
+const LINK_ROUTER_BATCH_CONTROL_SHEET = 'Controle - Sync Lotes';
+const LINK_ROUTER_SYNC_BATCH_SIZE = 40;
+const LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES = 1;
+const LINK_ROUTER_SYNC_BATCH_MAX_SECONDS = 1700;
+const LINK_ROUTER_BATCH_STATE_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_STATE_';
+const LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX = 'LINK_ROUTER_SYNC_BATCH_TRIGGER_';
 
 function doGet() {
   return HtmlService.createTemplateFromFile('index')
@@ -279,9 +285,10 @@ function updateRevShare(payload) {
   return getConfigData();
 }
 
-function getDashboardData(params) {
+function getDashboardData(params, options) {
   if (!params) throw new Error('Parâmetros inválidos.');
-  const snapshot = getConfigSnapshot_();
+  options = options || {};
+  const snapshot = options.snapshot || getConfigSnapshot_();
   const operationName = String(params.operation || '').trim();
   const trafficType = String(params.traffic || '').trim();
   if (!operationName) throw new Error('Selecione a operação.');
@@ -2656,15 +2663,28 @@ function ensureRevShareSheet_() {
   return sheet;
 }
 
-function ensureLinkRouterHistorySheet_() {
+function getLinkRouterBatchHistorySheetName_(batchIndex) {
+  return LINK_ROUTER_HISTORY_SHEET + ' - Lote ' + (batchIndex + 1);
+}
+
+function ensureLinkRouterHistorySheet_(sheetName) {
   var ss = SpreadsheetApp.getActive();
-  var sheet = ss.getSheetByName(LINK_ROUTER_HISTORY_SHEET);
+  var targetName = sheetName || LINK_ROUTER_HISTORY_SHEET;
+  var sheet = ss.getSheetByName(targetName);
   if (!sheet) {
-    sheet = ss.insertSheet(LINK_ROUTER_HISTORY_SHEET);
+    sheet = ss.insertSheet(targetName);
   }
   var headers = ['Timestamp', 'Operação', 'Tráfego', 'Empresa ID', 'Domínio ID', 'Slug', 'URL', 'Percentual Enviado (%)', 'Origem do Percentual', 'Status', 'Mensagem'];
-  sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-  sheet.setFrozenRows(1);
+  var existingHeaders = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  var hasAnyHeader = existingHeaders.some(function (value) {
+    return value !== '' && value !== null;
+  });
+  if (!hasAnyHeader) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+  }
+  if (sheet.getFrozenRows() < 1) {
+    sheet.setFrozenRows(1);
+  }
   return sheet;
 }
 
@@ -3628,10 +3648,11 @@ function standardDeviation_(values) {
   return Math.sqrt(sum / count);
 }
 
-function syncLinkRouterDistribution(request) {
+function syncLinkRouterDistribution(request, options) {
   if (!request) {
     throw new Error('Parâmetros inválidos.');
   }
+  options = options || {};
   var operation = String(request.operation || '').trim();
   var traffic = String(request.traffic || '').trim();
   var routeSlug = String(request.routeSlug || '').trim();
@@ -3655,7 +3676,7 @@ function syncLinkRouterDistribution(request) {
     params.distribution = request.distribution;
   }
 
-  var dashboard = getDashboardData(params);
+  var dashboard = getDashboardData(params, { snapshot: options.snapshot });
   var integration = dashboard && dashboard.integration ? dashboard.integration : null;
   if (!integration || !integration.companyId || !integration.domainId || !integration.routeSlug) {
     throw new Error('Integração Link Router não configurada para a operação selecionada.');
@@ -3768,7 +3789,7 @@ function syncLinkRouterDistribution(request) {
     row[10] = message;
     return row;
   });
-  appendLinkRouterHistory_(historyRows);
+  appendLinkRouterHistory_(historyRows, options.historySheetName);
 
   if (!success) {
     throw new Error(message);
@@ -3792,30 +3813,265 @@ function parseLinkRouterId_(value) {
   return isNaN(num) ? value : num;
 }
 
-function runLinkRouterAutoSync() {
+function ensureLinkRouterBatchControlSheet_() {
+  var ss = SpreadsheetApp.getActive();
+  var sheet = ss.getSheetByName(LINK_ROUTER_BATCH_CONTROL_SHEET);
+  var headers = ['Timestamp', 'Batch ID', 'Lote', 'Status', 'Rotas Processadas', 'Sucessos', 'Falhas', 'Tempo (s)', 'Mensagem'];
+  if (!sheet) {
+    sheet = ss.insertSheet(LINK_ROUTER_BATCH_CONTROL_SHEET);
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    return sheet;
+  }
+
+  var firstRow = sheet.getRange(1, 1, 1, headers.length).getValues()[0];
+  var headersMissing = false;
+  for (var i = 0; i < headers.length; i++) {
+    if (!firstRow[i] || firstRow[i] !== headers[i]) {
+      headersMissing = true;
+      break;
+    }
+  }
+
+  if (headersMissing) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+  }
+  return sheet;
+}
+
+function buildLinkRouterBatchStateKey_(batchId, batchIndex) {
+  return LINK_ROUTER_BATCH_STATE_KEY_PREFIX + batchId + '_' + batchIndex;
+}
+
+function buildLinkRouterBatchTriggerKey_(triggerUid) {
+  return LINK_ROUTER_BATCH_TRIGGER_KEY_PREFIX + triggerUid;
+}
+
+function appendLinkRouterBatchControlRow_(sheet, info) {
+  var values = [
+    info && info.timestamp ? info.timestamp : new Date(),
+    info && info.batchId ? info.batchId : '',
+    info && info.batchLabel ? info.batchLabel : '',
+    info && info.status ? info.status : '',
+    info && info.processed ? info.processed : 0,
+    info && info.successes ? info.successes : 0,
+    info && info.failures ? info.failures : 0,
+    info && info.durationSeconds ? info.durationSeconds : 0,
+    info && info.message ? info.message : ''
+  ];
+  sheet.appendRow(values);
+  return sheet.getLastRow();
+}
+
+function updateLinkRouterBatchControlRow_(rowNumber, info) {
+  if (!rowNumber) {
+    return;
+  }
+  var sheet = ensureLinkRouterBatchControlSheet_();
+  var values = [
+    info && info.timestamp ? info.timestamp : new Date(),
+    info && info.batchId ? info.batchId : '',
+    info && info.batchLabel ? info.batchLabel : '',
+    info && info.status ? info.status : '',
+    info && info.processed ? info.processed : 0,
+    info && info.successes ? info.successes : 0,
+    info && info.failures ? info.failures : 0,
+    info && info.durationSeconds ? info.durationSeconds : 0,
+    info && info.message ? info.message : ''
+  ];
+  sheet.getRange(rowNumber, 1, 1, values.length).setValues([values]);
+}
+
+function splitIntoBatches_(items, batchSize) {
+  var batches = [];
+  if (!items || !items.length || !batchSize || batchSize <= 0) {
+    return batches;
+  }
+  for (var i = 0; i < items.length; i += batchSize) {
+    batches.push(items.slice(i, i + batchSize));
+  }
+  return batches;
+}
+
+function cleanupOldBatchTriggers_() {
+  var props = PropertiesService.getScriptProperties();
+  var triggers = ScriptApp.getProjectTriggers().filter(function (trigger) {
+    return trigger.getHandlerFunction && trigger.getHandlerFunction() === 'runLinkRouterAutoSyncBatch';
+  });
+  triggers.forEach(function (trigger) {
+    var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
+    var triggerKey = triggerUid ? buildLinkRouterBatchTriggerKey_(triggerUid) : null;
+    var triggerInfoJson = triggerKey ? props.getProperty(triggerKey) : null;
+    if (!triggerInfoJson) {
+      ScriptApp.deleteTrigger(trigger);
+      return;
+    }
+    var triggerInfo;
+    try {
+      triggerInfo = JSON.parse(triggerInfoJson);
+    } catch (err) {
+      ScriptApp.deleteTrigger(trigger);
+      props.deleteProperty(triggerKey);
+      return;
+    }
+    var stateKey = buildLinkRouterBatchStateKey_(triggerInfo.batchId, triggerInfo.batchIndex);
+    var stateJson = props.getProperty(stateKey);
+    if (!stateJson) {
+      ScriptApp.deleteTrigger(trigger);
+      props.deleteProperty(triggerKey);
+      return;
+    }
+    var state;
+    try {
+      state = JSON.parse(stateJson);
+    } catch (e) {
+      ScriptApp.deleteTrigger(trigger);
+      props.deleteProperty(triggerKey);
+      props.deleteProperty(stateKey);
+      return;
+    }
+    var createdAt = state.createdAt ? new Date(state.createdAt) : null;
+    var isStale = createdAt && ((Date.now() - createdAt.getTime()) / (60 * 60 * 1000) > 6);
+    if (isStale) {
+      ScriptApp.deleteTrigger(trigger);
+      props.deleteProperty(triggerKey);
+      props.deleteProperty(stateKey);
+    }
+  });
+}
+
+function runLinkRouterAutoSyncOrchestrator() {
+  cleanupOldBatchTriggers_();
   var snapshot = getConfigSnapshot_();
   var integrations = (snapshot.operationIntegrationRows || []).filter(function (row) {
     return row && row.active && row.operation && row.companyId && row.domainId && row.routeSlug && row.trafficType;
   });
+  if (!integrations.length) {
+    updateLinkRouterAutoSyncTrigger_(snapshot);
+    return {
+      timestamp: new Date(),
+      batchesScheduled: 0,
+      message: 'Nenhuma integração ativa encontrada.'
+    };
+  }
+
+  var batches = splitIntoBatches_(integrations, LINK_ROUTER_SYNC_BATCH_SIZE);
+  var batchId = Utilities.getUuid();
+  var controlSheet = ensureLinkRouterBatchControlSheet_();
+  var props = PropertiesService.getScriptProperties();
+  var autoRange = getLinkRouterAutoSyncDateRange_();
+
+  batches.forEach(function (batch, index) {
+    var batchLabel = 'Lote ' + (index + 1) + '/' + batches.length;
+    var batchHistorySheetName = getLinkRouterBatchHistorySheetName_(index);
+    ensureLinkRouterHistorySheet_(batchHistorySheetName);
+    var rowNumber = appendLinkRouterBatchControlRow_(controlSheet, {
+      timestamp: new Date(),
+      batchId: batchId,
+      batchLabel: batchLabel,
+      status: 'AGENDADO'
+    });
+    var state = {
+      batchId: batchId,
+      batchIndex: index,
+      totalBatches: batches.length,
+      integrations: batch,
+      row: rowNumber,
+      createdAt: new Date().toISOString(),
+      autoRange: autoRange,
+      historySheetName: batchHistorySheetName
+    };
+    var stateKey = buildLinkRouterBatchStateKey_(batchId, index);
+    props.setProperty(stateKey, JSON.stringify(state));
+    var delayMs = index * LINK_ROUTER_SYNC_BATCH_DELAY_MINUTES * 60 * 1000;
+    // ScriptApp requires at least a 1-minute delay for time-based triggers; ensure a safe minimum.
+    var safeDelayMs = Math.max(delayMs, 60 * 1000);
+    var trigger = ScriptApp.newTrigger('runLinkRouterAutoSyncBatch')
+      .timeBased()
+      .after(safeDelayMs)
+      .create();
+    var triggerUid = trigger.getUniqueId ? trigger.getUniqueId() : '';
+    if (triggerUid) {
+      var triggerKey = buildLinkRouterBatchTriggerKey_(triggerUid);
+      props.setProperty(triggerKey, JSON.stringify({ batchId: batchId, batchIndex: index }));
+    }
+  });
+
+  updateLinkRouterAutoSyncTrigger_(snapshot);
+
+  return {
+    timestamp: new Date(),
+    batchId: batchId,
+    batchesScheduled: batches.length
+  };
+}
+
+function runLinkRouterAutoSyncBatch(e) {
+  var props = PropertiesService.getScriptProperties();
+  var triggerUid = e && e.triggerUid ? e.triggerUid : '';
+  var triggerKey = triggerUid ? buildLinkRouterBatchTriggerKey_(triggerUid) : null;
+  var triggerInfoJson = triggerKey ? props.getProperty(triggerKey) : null;
+  if (!triggerInfoJson) {
+    return;
+  }
+  var triggerInfo;
+  try {
+    triggerInfo = JSON.parse(triggerInfoJson);
+  } catch (err) {
+    props.deleteProperty(triggerKey);
+    return;
+  }
+  var stateKey = buildLinkRouterBatchStateKey_(triggerInfo.batchId, triggerInfo.batchIndex);
+  var stateJson = props.getProperty(stateKey);
+  if (!stateJson) {
+    props.deleteProperty(triggerKey);
+    return;
+  }
+  var state;
+  try {
+    state = JSON.parse(stateJson);
+  } catch (error) {
+    props.deleteProperty(stateKey);
+    props.deleteProperty(triggerKey);
+    return;
+  }
+
+  var startTime = new Date();
+  var startMs = startTime.getTime();
+  var snapshot = getConfigSnapshot_();
   var trafficByType = snapshot.trafficByType || {};
+  var autoRange = state.autoRange || getLinkRouterAutoSyncDateRange_();
+  var batchHistorySheetName = state.historySheetName || getLinkRouterBatchHistorySheetName_(state.batchIndex);
+  ensureLinkRouterHistorySheet_(batchHistorySheetName);
   var successes = [];
   var failures = [];
+  var processed = 0;
+  var timedOut = false;
 
-  integrations.forEach(function (integration) {
+  (state.integrations || []).forEach(function (integration) {
+    if (timedOut) {
+      return;
+    }
+    var elapsed = (Date.now() - startMs) / 1000;
+    if (elapsed >= LINK_ROUTER_SYNC_BATCH_MAX_SECONDS) {
+      timedOut = true;
+      return;
+    }
     var trafficType = integration.trafficType;
     var sources = trafficByType[trafficType] || [];
     if (!sources.length) {
-      var error = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
+      var missingError = new Error('Nenhuma utm_source configurada para o tráfego vinculado.');
       failures.push({
         operation: integration.operation,
         traffic: trafficType,
-        message: error.message
+        message: missingError.message
       });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, error);
+      logLinkRouterAutoSyncFailure_(integration, trafficType, missingError, batchHistorySheetName);
+      processed++;
       return;
     }
     try {
-      var autoRange = getLinkRouterAutoSyncDateRange_();
       var request = {
         operation: integration.operation,
         traffic: trafficType,
@@ -3828,7 +4084,7 @@ function runLinkRouterAutoSync() {
         request.startDate = autoRange.startDate;
         request.endDate = autoRange.endDate;
       }
-      var result = syncLinkRouterDistribution(request);
+      var result = syncLinkRouterDistribution(request, { snapshot: snapshot, historySheetName: batchHistorySheetName });
       successes.push({
         operation: integration.operation,
         traffic: trafficType,
@@ -3842,17 +4098,54 @@ function runLinkRouterAutoSync() {
         traffic: trafficType,
         message: err && err.message ? err.message : String(err)
       });
-      logLinkRouterAutoSyncFailure_(integration, trafficType, err);
+      logLinkRouterAutoSyncFailure_(integration, trafficType, err, batchHistorySheetName);
     }
+    processed++;
   });
 
-  updateLinkRouterAutoSyncTrigger_(snapshot);
+  var durationSeconds = Math.round((Date.now() - startMs) / 1000);
+  var status = timedOut ? 'PARCIAL' : 'CONCLUÍDO';
+  var message = timedOut ? 'Execução interrompida por tempo limite.' : '';
+  updateLinkRouterBatchControlRow_(state.row, {
+    timestamp: startTime,
+    batchId: state.batchId,
+    batchLabel: 'Lote ' + (state.batchIndex + 1) + '/' + (state.totalBatches || ''),
+    status: status,
+    processed: processed,
+    successes: successes.length,
+    failures: failures.length,
+    durationSeconds: durationSeconds,
+    message: message
+  });
+
+  props.deleteProperty(stateKey);
+  if (triggerKey) {
+    props.deleteProperty(triggerKey);
+  }
+  if (triggerUid) {
+    ScriptApp.getProjectTriggers().forEach(function (trigger) {
+      var uid = trigger.getUniqueId ? trigger.getUniqueId() : '';
+      if (uid && uid === triggerUid) {
+        ScriptApp.deleteTrigger(trigger);
+      }
+    });
+  }
+
+  if (!timedOut && state.batchIndex === (state.totalBatches - 1)) {
+    cleanupOldBatchTriggers_();
+  }
 
   return {
-    timestamp: new Date(),
+    timestamp: startTime,
+    batchId: state.batchId,
+    batchIndex: state.batchIndex,
     successes: successes,
     failures: failures
   };
+}
+
+function runLinkRouterAutoSync() {
+  return runLinkRouterAutoSyncOrchestrator();
 }
 
 function getLinkRouterAutoSyncDateRange_(now) {
@@ -3875,28 +4168,40 @@ function updateLinkRouterAutoSyncTrigger_(snapshot) {
   var hasActiveIntegration = (snapshot.operationIntegrationRows || []).some(function (row) {
     return row && row.active && row.operation && row.companyId && row.domainId && row.routeSlug && row.trafficType;
   });
-  var triggers = ScriptApp.getProjectTriggers().filter(function (trigger) {
+  var triggers = ScriptApp.getProjectTriggers();
+  var orchestratorTriggers = triggers.filter(function (trigger) {
+    return trigger.getHandlerFunction && trigger.getHandlerFunction() === 'runLinkRouterAutoSyncOrchestrator';
+  });
+  var legacyTriggers = triggers.filter(function (trigger) {
     return trigger.getHandlerFunction && trigger.getHandlerFunction() === 'runLinkRouterAutoSync';
   });
 
   if (hasActiveIntegration) {
-    if (triggers.length) {
-      triggers.forEach(function (trigger) {
+    if (legacyTriggers.length) {
+      legacyTriggers.forEach(function (trigger) {
         ScriptApp.deleteTrigger(trigger);
       });
     }
-    ScriptApp.newTrigger('runLinkRouterAutoSync')
-      .timeBased()
-      .everyHours(1)
-      .create();
-  } else if (triggers.length) {
-    triggers.forEach(function (trigger) {
+    if (orchestratorTriggers.length > 1) {
+      orchestratorTriggers.slice(1).forEach(function (trigger) {
+        ScriptApp.deleteTrigger(trigger);
+      });
+    }
+    if (!orchestratorTriggers.length) {
+      ScriptApp.newTrigger('runLinkRouterAutoSyncOrchestrator')
+        .timeBased()
+        .everyHours(1)
+        .create();
+    }
+  } else {
+    orchestratorTriggers.concat(legacyTriggers).forEach(function (trigger) {
       ScriptApp.deleteTrigger(trigger);
     });
+    cleanupOldBatchTriggers_();
   }
 }
 
-function logLinkRouterAutoSyncFailure_(integration, trafficType, error) {
+function logLinkRouterAutoSyncFailure_(integration, trafficType, error, historySheetName) {
   var message = error && error.message ? error.message : String(error || 'Erro desconhecido');
   var row = [
     new Date(),
@@ -3911,14 +4216,14 @@ function logLinkRouterAutoSyncFailure_(integration, trafficType, error) {
     'ERRO',
     message
   ];
-  appendLinkRouterHistory_([row]);
+  appendLinkRouterHistory_([row], historySheetName);
 }
 
-function appendLinkRouterHistory_(rows) {
+function appendLinkRouterHistory_(rows, sheetName) {
   if (!rows || !rows.length) {
     return;
   }
-  var sheet = ensureLinkRouterHistorySheet_();
+  var sheet = ensureLinkRouterHistorySheet_(sheetName);
   var startRow = Math.max(sheet.getLastRow(), 1) + 1;
   sheet.getRange(startRow, 1, rows.length, rows[0].length).setValues(rows);
 }
